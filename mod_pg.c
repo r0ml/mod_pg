@@ -2,7 +2,7 @@
 /*
  On linux, build with:
  
-  sudo apxs -i -c mod_pg.c -lpq
+  sudo apxs -i -I/usr/include/postgresql -c mod_pg.c -lpq
 
  */
 
