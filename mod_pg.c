@@ -28,20 +28,18 @@
 #include <string.h>
 #include <libpq-fe.h>
 
-const int ONE_YEAR = 31536000;
-
-/* HOME must be set to a directory that the httpd daemon has access to -- otherwise 
-   the attempt to open the git repository will fail */
-
 extern module pg_module;
 
 struct pq_dir_config {
     PGconn *conn;
 //    const char *repo_path;
     const char *connection_string;
+    const char *active_conn_string;
     const char *stored_proc;
     const char *command;
     const char *path;
+    apr_table_t *parm_headers;
+    apr_table_t *parm_cookies;
     int location;
     apr_hash_t *connection_hash;
 };
@@ -49,17 +47,82 @@ struct pq_dir_config {
 static void pq_child_init(apr_pool_t *pool, server_rec *s) {
 }
 
-const size_t MAX_POST_SIZE=1024000;
+typedef struct {
+    char *buf;
+    int len;
+} buf_and_len;
 
 apr_table_do_callback_fn_t paramcb;
 int paramcb(void *rec, const char *k, const char *v) {
-    char *caten = (char *)rec;
-    strncat(caten, "\"", MAX_POST_SIZE);
-    strncat(caten, k, MAX_POST_SIZE);
-    strncat(caten, "\": \"", MAX_POST_SIZE);
-    strncat(caten, v, MAX_POST_SIZE);
-    strncat(caten, "\",", MAX_POST_SIZE);
+    buf_and_len *cc = (buf_and_len *)rec;
+    char *caten = cc->buf;
+    int len = cc->len;
+    if ( 0 == strcmp(k, "db-connexion") ) return 1;
+    strncat(caten, "\"", len);
+    strncat(caten, k, len);
+    strncat(caten, "\": \"", len);
+    strncat(caten, v, len);
+    strncat(caten, "\",", len);
     return 1;
+}
+
+const size_t MAX_POST_SIZE=1024000;
+
+typedef struct {
+    apr_table_t *from;
+    apr_table_t *to;
+} xtbls;
+
+apr_table_do_callback_fn_t setfrom;
+int setfrom(void *rec, const char *k, const char *v) {
+    xtbls *xt = (xtbls *)rec;
+    apr_table_add(xt->to, v, apr_table_get(xt->from, k));
+    return 1;
+}
+
+typedef struct {
+    apr_table_t *to;
+    request_rec *r;
+} ytbls;
+
+
+apr_table_do_callback_fn_t setfromcookie;
+int setfromcookie(void *rec, const char *k, const char *v) {
+    ytbls *yt = (ytbls *)rec;
+    const char *c;
+    ap_cookie_read(yt->r, k, &c, 0);
+    apr_table_add(yt->to, v, c);
+    return 1;
+}
+
+
+apr_table_do_callback_fn_t bparm;
+int bparm(void *rec, const char *k, const char *v) {
+    buf_and_len *cc = (buf_and_len *)rec;
+    char *caten = cc->buf;
+    int len = cc->len;
+    if (v != NULL) {
+      strncat(caten, "\"", len);
+      strncat(caten, k, len);
+      strncat(caten, "\": \"", len);
+      strncat(caten, v, len);
+      strncat(caten, "\",", len);
+    }
+    return 1;
+}
+
+char *table_to_json(apr_pool_t *p, apr_table_t *t) {
+    buf_and_len bl;
+    char buf[16384];
+    bl.buf = &buf[0];
+    bl.len = 16380;
+    buf[16380]='\0';
+    buf[0]='{';
+    buf[1]='\0';
+    apr_table_do(bparm, &bl, t, NULL);
+    buf[strlen(buf)-1]='\0';
+    strncat(buf,"}",bl.len+1);
+    return apr_pstrdup(p, buf);
 }
 
 static int pq_handler(request_rec *r) {
@@ -69,7 +132,6 @@ static int pq_handler(request_rec *r) {
         return DECLINED;
     }
     
-    /* Must be a POST */
     r->allowed |= (AP_METHOD_BIT << M_POST);
     r->allowed |= (AP_METHOD_BIT << M_GET);
     
@@ -80,33 +142,36 @@ static int pq_handler(request_rec *r) {
 
     struct pq_dir_config *gdc = (struct pq_dir_config *) ap_get_module_config(r->per_dir_config, &pg_module);
     
+/*
     core_dir_config *cd = ap_get_core_module_config(r->per_dir_config);
     core_request_config *core = ap_get_core_module_config(r->request_config);
 
     
     const char *pgconn = NULL;
     const char *connstr = gdc->connection_string;
+    */
     
     /* Get the sessionid from the cookie, or create a new sessionid and set the cookie */
     // ap_cookie_read(r, "postgresql", &pgconn, 0);
 
+/*
     ap_cookie_read(r, "JSESSIONID", &pgconn, 0);
     const size_t SESSION_SIZE=32;
     unsigned char sbuf[SESSION_SIZE];
     char xbuf[1+SESSION_SIZE * 2];
+ */
 
-    if (pgconn == NULL) { // there is no cookie
-        return HTTP_NETWORK_AUTHENTICATION_REQUIRED; // somebody needs to have set JSESSIONID
+//    if (pgconn == NULL) { // there is no cookie
+//        return HTTP_NETWORK_AUTHENTICATION_REQUIRED; // somebody needs to have set JSESSIONID
         // but it is not I
 /*        apr_generate_random_bytes(sbuf, SESSION_SIZE);
         ap_bin2hex(sbuf, SESSION_SIZE, &xbuf[0]);
         ap_cookie_write(r, "postgresql", xbuf, "path=/", ONE_YEAR, r->headers_out, NULL);
         pgconn = &xbuf[0];
  */
-    }
+//    }
     
     const char *docroot = gdc->path == NULL || gdc->location ? ap_context_document_root(r) : gdc->path;
-    const char *rp = docroot; // gdc->repo_path
     const char *pi;
     if (gdc->location) {
         pi = r->uri + strlen(gdc->path); }
@@ -180,7 +245,10 @@ doget:;
     apr_table_t *reqparams;
     ap_args_to_table(r, &reqparams);
     strncat(post, ", \"args\":{ ", MAX_POST_SIZE);
-    apr_table_do(paramcb, post, reqparams, NULL);
+    buf_and_len bl;
+    bl.buf = post;
+    bl.len = MAX_POST_SIZE;
+    apr_table_do(paramcb, &bl, reqparams, NULL);
     post[strlen(post)-1] = '\0';  // shorten by removing the trailing , (if any)
     strncat(post, "}}", MAX_POST_SIZE);
     
@@ -198,8 +266,31 @@ gotpost:;
     
     
     /* connect to the server (using generic-account?) */
-    if (gdc->conn == NULL) {
-        gdc->conn = PQconnectdb(gdc->connection_string);
+    
+    
+    const char *df = gdc->connection_string;
+    const char *tcd;
+    ap_cookie_read(r, "db_conn_string", &tcd, 0);
+
+    const char *tcs = tcd;
+    
+    // // for catching internal redirects
+    // const char *dn = apr_table_get(r->headers_in, "db_conn_string");
+    // if (dn != NULL) tcs = dn;
+    
+    if (tcd == NULL) tcs = df; // put the default back
+    else tcs = apr_pstrcat(r->pool, df, " ", tcd, NULL );
+    
+    if (tcd != NULL) apr_table_add(r->headers_out,"X-Db", tcd);
+
+    // *********************** r0ml
+    
+    if (gdc->conn == NULL || strcmp(gdc->active_conn_string, tcs)) {
+        if (gdc->conn != NULL) { PQfinish(gdc->conn); gdc->conn = NULL; }
+        if (gdc->active_conn_string != NULL) free(gdc->active_conn_string);
+        gdc->active_conn_string = strdup(tcs);
+        fprintf(stderr, "db connect to %s\n", tcs);
+        gdc->conn = PQconnectdb(tcs);
         if (gdc->conn == NULL || CONNECTION_OK != PQstatus(gdc->conn)) {
             const char *errm = gdc->conn == NULL ? "unknown failure" : PQerrorMessage(gdc->conn);
             ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(09050) "PQconnectdb failed: %s", errm);
@@ -211,15 +302,29 @@ gotpost:;
         }
     }
     
-    const char *uagent = apr_table_get(r->headers_in, "User-Agent");
-    const char *paramValues[5];
-    paramValues[0]=r->useragent_ip;  // this is the requestor ip address
-    paramValues[1]=uagent;  // this is the user-agent string
-    paramValues[2]=pgconn;  // this is the session id
-    paramValues[3]=""; // this should be the session user -- but dont know how to do that
-    if (postlen == 0) paramValues[4] = NULL; else paramValues[4]=post;
+    // const char *uagent = apr_table_get(r->headers_in, "User-Agent");
+    const char *paramValues[2];
     
-    PGresult *sres = PQexecParams(gdc->conn, gdc->command, 5, NULL, paramValues, NULL, NULL, 0);
+    xtbls xx;
+    xx.from = r->headers_in;
+    xx.to = apr_table_make(r->pool, 10);
+    
+    apr_table_set(xx.to, "ip_address", r->useragent_ip);
+    
+    apr_table_do(setfrom, &xx, gdc->parm_headers, NULL);
+
+    ytbls yy;
+    yy.to = xx.to;
+    yy.r = r;
+    apr_table_do(setfromcookie, &yy, gdc->parm_cookies, NULL);
+
+    char *jt = table_to_json(r->pool, yy.to);
+    
+
+    paramValues[0]=jt;  // this is the user-agent string
+    paramValues[1] = postlen == 0 ? NULL : post;
+    
+    PGresult *sres = PQexecParams(gdc->conn, gdc->command, 2, NULL, paramValues, NULL, NULL, 0);
     if (PQresultStatus(sres) != PGRES_TUPLES_OK) {
         ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(09061) "postgresql query error: %s", PQresultErrorMessage(sres) );
         PQfinish(gdc->conn);
@@ -228,41 +333,11 @@ gotpost:;
     }
     int ns = PQntuples(sres);
     if (ns != 1) {
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(93039)
-                      "expected single row from api.api");
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(93039) "expected single row from api.api");
         return HTTP_INTERNAL_SERVER_ERROR;
     }
-/*
-    PQgetvalue(sres,0,0); // email for the session (logged in as)
-    PQgetvalue(sres,0,1); // company
-    PQgetvalue(sres,0,2); // role
-    PQgetvalue(sres,0,3); // vursion
-    PQgetvalue(sres,0,4); // intercom
-
-    const char *paramValues[3];
-    paramValues[0]="1.2.3.4"; // the IP address
-    paramValues[1]="user-agent"; // the User agent
-    paramValues[2]=post;
-    PGresult *res = PQexecParams(gdc->conn, "select api.login($1,$2,$3)", 3, NULL, paramValues, NULL, NULL, 0);
-    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(09061) "postgresql query error: %s", PQresultErrorMessage(res) );
-        PQfinish(gdc->conn);
-        gdc->conn = NULL;
-        return HTTP_INTERNAL_SERVER_ERROR;
-    }
-    
-    int n = PQntuples(res);
-    if (n != 1) {
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(93039)
-                      "not one row returned");
-        return HTTP_INTERNAL_SERVER_ERROR;
-    }
-     */
-
     
     const char *xres = PQgetvalue(sres,0,0);
-
-//    const char *xres = "this is a test";
 
     apr_bucket_brigade *bb = apr_brigade_create(r->pool, c->bucket_alloc);
     apr_brigade_write(bb, NULL, NULL, xres, strlen(xres));
@@ -272,8 +347,7 @@ gotpost:;
     APR_BRIGADE_INSERT_TAIL(bb, b);
     rv = ap_pass_brigade(r->output_filters, bb);
     if (rv != APR_SUCCESS) {
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO(01236)
-                      "mod_pg: ap_pass_brigade failed");
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO(01236) "mod_pg: ap_pass_brigade failed");
         return HTTP_INTERNAL_SERVER_ERROR;
     }
     
@@ -288,13 +362,30 @@ static void register_hooks(apr_pool_t *p) {
     ap_hook_child_init(pq_child_init, NULL, NULL, APR_HOOK_MIDDLE);
 }
 
+static const char *init_pq_cookie(cmd_parms *cmd, void *dconf, const char *pn, const char *val) {
+    struct pq_dir_config *gdc = (struct pq_dir_config *)dconf;
+    apr_table_add(gdc->parm_cookies, pn, val == NULL ? pn : val);
+    return NULL;
+}
+
+static const char *init_pq_header(cmd_parms *cmd, void *dconf, const char *pn, const char *val) {
+    struct pq_dir_config *gdc = (struct pq_dir_config *)dconf;
+    apr_table_add(gdc->parm_headers, pn, val == NULL ? pn : val);
+    return NULL;
+}
+
 static const char *init_pq_config(cmd_parms *cmd, void *dconf, const char *pn, const char *dv) {
     struct pq_dir_config *gdc = (struct pq_dir_config *)dconf;
-//    gdc->repo_path = apr_pstrdup(cmd->pool ,rep);
-    gdc->connection_string = apr_pstrdup(cmd->pool, dv);
-
+    
+    gdc->parm_headers = apr_table_make(cmd->pool, 10);
+    gdc->parm_cookies = apr_table_make(cmd->pool, 10);
+    
+    gdc->connection_string = apr_pstrcat(cmd->pool, dv," ",NULL);
+    gdc->active_conn_string = NULL;
+    gdc->conn = NULL;
+    
     char cmdbuf[256];
-    snprintf(cmdbuf, 255, "select * from %s($1, $2, $3, $4, $5)", pn);
+    snprintf(cmdbuf, 255, "select * from %s($1, $2)", pn);
     gdc->stored_proc = apr_pstrdup(cmd->pool, pn);
     gdc->command = apr_pstrdup(cmd->pool, cmdbuf);
 
@@ -312,11 +403,9 @@ static const char *init_pq_config(cmd_parms *cmd, void *dconf, const char *pn, c
         gdc->location = 1; // return "Git in LocationMatch stanza not supported";
     }
     
-/*
     if (0 == strcasecmp("<Directory", parent)) {
-        return "Git configuration should be in a Location, not a Directory";
+        return "PotgreSQL configuration should be in a Location, not a Directory";
     }
- */
     return NULL;
 }
 
@@ -328,27 +417,17 @@ static void *create_pq_dir_config(apr_pool_t *pool, char *d) {
     return n;
 }
 
-/*
- static void *merge_git_dir_config(apr_pool_t* pool, void *base, void *add) {
-    struct git_dir_config *n = create_git_dir_config(pool, NULL);
-    struct git_dir_config *na = add;
-    n->repo = na -> repo;
-    n->repo_path = na->repo_path == NULL ? NULL : apr_pstrdup(pool, na->repo_path);
-    n->default_vursion = na->repo_path == NULL ? NULL : apr_pstrdup(pool, na->default_vursion);
-    return add;
-}
-*/
-
 static const command_rec pq_cmds[] = {
-    AP_INIT_TAKE2("PostgreSQL", init_pq_config, NULL, RSRC_CONF|ACCESS_CONF, "PostgreSQL connection string"),
+    AP_INIT_TAKE2("PostgreSQL", init_pq_config, NULL, RSRC_CONF|ACCESS_CONF, "PostgreSQL stored-procedure and connection-string"),
+    AP_INIT_TAKE12("PostgresCookie", init_pq_cookie, NULL, RSRC_CONF|ACCESS_CONF, "Cookie to pass to the database api procedure"),
+    AP_INIT_TAKE12("PostgresHeader", init_pq_header, NULL, RSRC_CONF|ACCESS_CONF, "Request header to pass to the database api procedure"),
     {NULL}
 };
 
 AP_DECLARE_MODULE(pg) = {
     STANDARD20_MODULE_STUFF,
     create_pq_dir_config,              /* create per-directory (location, really) config structure */
-//    merge_git_dir_config,              /* merge per-directory config structures */
-    NULL,
+    NULL,              /* merge per-directory config structures */
     NULL,              /* create per-server config structure */
     NULL,              /* merge per-server config structures */
     pq_cmds,              /* command apr_table_t */
