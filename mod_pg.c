@@ -284,7 +284,8 @@ gotpost:;
     if (tcd != NULL) apr_table_add(r->headers_out,"X-Db", tcd);
 
     // *********************** r0ml
-    
+
+
     if (gdc->conn == NULL || strcmp(gdc->active_conn_string, tcs)) {
         if (gdc->conn != NULL) { PQfinish(gdc->conn); gdc->conn = NULL; }
         if (gdc->active_conn_string != NULL) free(gdc->active_conn_string);
@@ -324,25 +325,31 @@ gotpost:;
     paramValues[0]=jt;  // this is the user-agent string
     paramValues[1] = postlen == 0 ? NULL : post;
     
+    int toReturn = OK;
+    
     PGresult *sres = PQexecParams(gdc->conn, gdc->command, 2, NULL, paramValues, NULL, NULL, 0);
     if (PQresultStatus(sres) != PGRES_TUPLES_OK) {
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(09061) "postgresql query error: %s", PQresultErrorMessage(sres) );
+        const char *dberr = PQresultErrorMessage(sres);
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(09061) "postgresql query error: %s", dberr );
         PQfinish(gdc->conn);
         gdc->conn = NULL;
+        apr_table_add(r->err_headers_out, "X-DbErr", dberr);
         return HTTP_INTERNAL_SERVER_ERROR;
     }
     int ns = PQntuples(sres);
     if (ns != 1) {
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(93039) "expected single row from api.api");
-        return HTTP_INTERNAL_SERVER_ERROR;
+        const char *dberr = "expected single row from api.api";
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(93039) "%s", dberr);
+        apr_table_add(r->err_headers_out, "X-DbErr", dberr);
+        return  HTTP_INTERNAL_SERVER_ERROR;
     }
-    
-    const char *xres = PQgetvalue(sres,0,0);
 
     apr_bucket_brigade *bb = apr_brigade_create(r->pool, c->bucket_alloc);
+    const char *xres = PQgetvalue(sres,0,0);
     apr_brigade_write(bb, NULL, NULL, xres, strlen(xres));
     PQclear(sres);
-
+    ap_set_content_type(r, "application/json");
+    
     apr_bucket *b = apr_bucket_eos_create(c->bucket_alloc);
     APR_BRIGADE_INSERT_TAIL(bb, b);
     rv = ap_pass_brigade(r->output_filters, bb);
@@ -350,8 +357,6 @@ gotpost:;
         ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO(01236) "mod_pg: ap_pass_brigade failed");
         return HTTP_INTERNAL_SERVER_ERROR;
     }
-    
-    ap_set_content_type(r, "application/json");
     
     return OK; // OK is ambiguous -- should be 0
 }
