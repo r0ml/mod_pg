@@ -30,7 +30,7 @@
 
 extern module pg_module;
 
-struct pq_dir_config {
+typedef struct {
     PGconn *conn;
 //    const char *repo_path;
     const char *connection_string;
@@ -42,7 +42,7 @@ struct pq_dir_config {
     apr_table_t *parm_cookies;
     int location;
     apr_hash_t *connection_hash;
-};
+} pq_dir_config;
 
 static void pq_child_init(apr_pool_t *pool, server_rec *s) {
 }
@@ -140,46 +140,16 @@ static int pq_handler(request_rec *r) {
     else if (r->method_number == M_GET) { isaget = 1; }
     else return DECLINED;
 
-    struct pq_dir_config *gdc = (struct pq_dir_config *) ap_get_module_config(r->per_dir_config, &pg_module);
+    pq_dir_config *gdc = (pq_dir_config *) ap_get_module_config(r->per_dir_config, &pg_module);
     
 /*
-    core_dir_config *cd = ap_get_core_module_config(r->per_dir_config);
-    core_request_config *core = ap_get_core_module_config(r->request_config);
-
-    
-    const char *pgconn = NULL;
-    const char *connstr = gdc->connection_string;
-    */
-    
-    /* Get the sessionid from the cookie, or create a new sessionid and set the cookie */
-    // ap_cookie_read(r, "postgresql", &pgconn, 0);
-
-/*
-    ap_cookie_read(r, "JSESSIONID", &pgconn, 0);
-    const size_t SESSION_SIZE=32;
-    unsigned char sbuf[SESSION_SIZE];
-    char xbuf[1+SESSION_SIZE * 2];
+   currently, the configuration identifies which cookies / headers to pass to postgres.
+   hence, whatever the session strategy is can be accomodated.
+   
+   database connections are not associated with a session here.  A websocket implementation would
+   probably be the best bet for that.
  */
 
-//    if (pgconn == NULL) { // there is no cookie
-//        return HTTP_NETWORK_AUTHENTICATION_REQUIRED; // somebody needs to have set JSESSIONID
-        // but it is not I
-/*        apr_generate_random_bytes(sbuf, SESSION_SIZE);
-        ap_bin2hex(sbuf, SESSION_SIZE, &xbuf[0]);
-        ap_cookie_write(r, "postgresql", xbuf, "path=/", ONE_YEAR, r->headers_out, NULL);
-        pgconn = &xbuf[0];
- */
-//    }
-    
-    const char *docroot = gdc->path == NULL || gdc->location ? ap_context_document_root(r) : gdc->path;
-    const char *pi;
-    if (gdc->location) {
-        pi = r->uri + strlen(gdc->path); }
-    else {
-        pi = r->filename + strlen(docroot);
-    }
-    while(*pi == '/') pi++;
-    
     char post[MAX_POST_SIZE];
     size_t postlen = 0;
     
@@ -226,7 +196,9 @@ static int pq_handler(request_rec *r) {
     goto gotpost;
     
 doget:;
-    const char *ppi = r->path_info;
+    const char *ppi = r->filename + strlen(gdc->path);
+    while(*ppi == '/') ppi++;
+
     const char *empty = "";
     if (ppi == NULL) { postlen = 0; ppi = empty; }
     else {
@@ -254,20 +226,7 @@ doget:;
     
 gotpost:;
     
-    
-    /* the connection logic is as follows:
-           The request is either pre-login or post-login
-               Pre-Login takes the ip-address, session-id, NULL, and database request
-                            executes them under a generic (not-logged-in) account, and returns the result
-               Post-Login takes the ip-address, session-id, desired-user, and database request
-                            validates the session (check_session? validate_session), 
-                            runs the "become" code, and returns the result.
-     */
-    
-    
-    /* connect to the server (using generic-account?) */
-    
-    
+    // connect to the server
     const char *df = gdc->connection_string;
     const char *tcd;
     ap_cookie_read(r, "db_conn_string", &tcd, 0);
@@ -283,12 +242,9 @@ gotpost:;
     
     if (tcd != NULL) apr_table_add(r->headers_out,"X-Db", tcd);
 
-    // *********************** r0ml
-
-
     if (gdc->conn == NULL || strcmp(gdc->active_conn_string, tcs)) {
         if (gdc->conn != NULL) { PQfinish(gdc->conn); gdc->conn = NULL; }
-        if (gdc->active_conn_string != NULL) free(gdc->active_conn_string);
+        if (gdc->active_conn_string != NULL) free( (void *)gdc->active_conn_string);
         gdc->active_conn_string = strdup(tcs);
         fprintf(stderr, "db connect to %s\n", tcs);
         gdc->conn = PQconnectdb(tcs);
@@ -303,7 +259,6 @@ gotpost:;
         }
     }
     
-    // const char *uagent = apr_table_get(r->headers_in, "User-Agent");
     const char *paramValues[2];
     
     xtbls xx;
@@ -324,8 +279,6 @@ gotpost:;
 
     paramValues[0]=jt;  // this is the user-agent string
     paramValues[1] = postlen == 0 ? NULL : post;
-    
-    int toReturn = OK;
     
     PGresult *sres = PQexecParams(gdc->conn, gdc->command, 2, NULL, paramValues, NULL, NULL, 0);
     if (PQresultStatus(sres) != PGRES_TUPLES_OK) {
@@ -362,25 +315,49 @@ gotpost:;
 }
 
 
+
+static int pg_trans(request_rec *r) {
+    pq_dir_config *gdc = (pq_dir_config *)ap_get_module_config(r->per_dir_config, &pg_module);
+    if (gdc->connection_string == NULL || gdc->connection_string[0]=='\0' ) return DECLINED;
+    r->handler="postgresql";
+    return OK;
+}
+
+static int pg_map_location(request_rec *r) {
+    pq_dir_config *gdc = ap_get_module_config(r->per_dir_config, &pg_module);
+    if (r->handler != NULL && strcmp(r->handler,"postgresql") == 0) return OK;
+    if (gdc->connection_string == NULL || gdc->connection_string[0]=='\0' ) return DECLINED;
+    return OK; // bypasses core map_to_storage
+}
+
+
 static void register_hooks(apr_pool_t *p) {
+    static const char * const aszSucc[] = { "mod_rewrite.c", NULL};
+    
     ap_hook_handler(pq_handler,NULL,NULL,APR_HOOK_MIDDLE);
     ap_hook_child_init(pq_child_init, NULL, NULL, APR_HOOK_MIDDLE);
+    
+    // filename-to-URI translation -- this is where I figure out I need to use git
+    ap_hook_translate_name(pg_trans, aszSucc, NULL, APR_HOOK_FIRST );
+    
+    // suppress the file system access
+    ap_hook_map_to_storage(pg_map_location, NULL, NULL, APR_HOOK_FIRST);
 }
 
 static const char *init_pq_cookie(cmd_parms *cmd, void *dconf, const char *pn, const char *val) {
-    struct pq_dir_config *gdc = (struct pq_dir_config *)dconf;
+    pq_dir_config *gdc = (pq_dir_config *)dconf;
     apr_table_add(gdc->parm_cookies, pn, val == NULL ? pn : val);
     return NULL;
 }
 
 static const char *init_pq_header(cmd_parms *cmd, void *dconf, const char *pn, const char *val) {
-    struct pq_dir_config *gdc = (struct pq_dir_config *)dconf;
+    pq_dir_config *gdc = (pq_dir_config *)dconf;
     apr_table_add(gdc->parm_headers, pn, val == NULL ? pn : val);
     return NULL;
 }
 
 static const char *init_pq_config(cmd_parms *cmd, void *dconf, const char *pn, const char *dv) {
-    struct pq_dir_config *gdc = (struct pq_dir_config *)dconf;
+    pq_dir_config *gdc = (pq_dir_config *)dconf;
     
     gdc->parm_headers = apr_table_make(cmd->pool, 10);
     gdc->parm_cookies = apr_table_make(cmd->pool, 10);
@@ -415,8 +392,8 @@ static const char *init_pq_config(cmd_parms *cmd, void *dconf, const char *pn, c
 }
 
 static void *create_pq_dir_config(apr_pool_t *pool, char *d) {
-    struct pq_dir_config *n = (struct pq_dir_config *)apr_pcalloc(pool, sizeof(struct pq_dir_config));
-    n->connection_string = "";
+    pq_dir_config *n = (pq_dir_config *)apr_pcalloc(pool, sizeof(pq_dir_config));
+    n->connection_string = NULL;
     /* The hash table must be created during configuration */
     n->connection_hash = apr_hash_make(pool);
     return n;
