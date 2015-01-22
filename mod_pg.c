@@ -125,6 +125,11 @@ char *table_to_json(apr_pool_t *p, apr_table_t *t) {
     return apr_pstrdup(p, buf);
 }
 
+static void noticer(void *arg, const PGresult *res) {
+    // comment this out to avoid logging notices
+    fprintf(stderr, "%s\n", PQresultErrorMessage(res));
+}
+
 static int pq_handler(request_rec *r) {
     apr_status_t rv;
 
@@ -246,7 +251,7 @@ gotpost:;
         if (gdc->conn != NULL) { PQfinish(gdc->conn); gdc->conn = NULL; }
         if (gdc->active_conn_string != NULL) free( (void *)gdc->active_conn_string);
         gdc->active_conn_string = strdup(tcs);
-        fprintf(stderr, "db connect to %s\n", tcs);
+        // fprintf(stderr, "db connect to %s\n", tcs);
         gdc->conn = PQconnectdb(tcs);
         if (gdc->conn == NULL || CONNECTION_OK != PQstatus(gdc->conn)) {
             const char *errm = gdc->conn == NULL ? "unknown failure" : PQerrorMessage(gdc->conn);
@@ -257,6 +262,7 @@ gotpost:;
             }
             return HTTP_INTERNAL_SERVER_ERROR;
         }
+        PQsetNoticeReceiver(gdc->conn, noticer, NULL);
     }
     
     const char *paramValues[2];
@@ -279,6 +285,8 @@ gotpost:;
 
     paramValues[0]=jt;  // this is the user-agent string
     paramValues[1] = postlen == 0 ? NULL : post;
+    
+    // fprintf(stderr, "cmd: %s, metadata: %s, args: %s", gdc->command, paramValues[0], paramValues[1]);
     
     PGresult *sres = PQexecParams(gdc->conn, gdc->command, 2, NULL, paramValues, NULL, NULL, 0);
     if (PQresultStatus(sres) != PGRES_TUPLES_OK) {
