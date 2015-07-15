@@ -9,6 +9,23 @@
 
 #include <stdio.h>
 
+#if defined(__APPLE__)
+#include <apr_strings.h>
+#include <apache2/ap_config.h>
+#include <apache2/httpd.h>
+#include <apache2/http_config.h>
+#include <apache2/http_protocol.h>
+#include <apache2/http_log.h>
+#include <apache2/util_script.h>
+#include <apache2/http_main.h>
+#include <apache2/http_request.h>
+
+#include <apache2/util_cookies.h>
+
+#include <apache2/mod_core.h>
+#include <apache2/http_core.h>
+
+#else
 #include "apr_strings.h"
 #include "ap_config.h"
 #include "httpd.h"
@@ -23,10 +40,11 @@
 
 #include "mod_core.h"
 #include "http_core.h"
+#endif
 
 #include <stdio.h>
 #include <string.h>
-#include <libpq-fe.h>
+#include "libpq-fe.h"
 
 extern module pg_module;
 
