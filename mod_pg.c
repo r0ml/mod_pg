@@ -190,7 +190,7 @@ static int pq_handler(request_rec *r) {
             ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO(01224) "Timeout during reading request entity data");
             return HTTP_REQUEST_TIME_OUT;
         }
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO(01225) "Error reading request entityt data");
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO(01225) "Error reading request entity data");
         return HTTP_INTERNAL_SERVER_ERROR;
     }
 
@@ -290,6 +290,11 @@ gotpost:;
     xx.to = apr_table_make(r->pool, 10);
     
     apr_table_set(xx.to, "ip_address", r->useragent_ip);
+    
+    apr_table_add(xx.to, "query_string", r->args ? r->args : "");
+    apr_table_add(xx.to, "uri", r->uri);
+    apr_table_add(xx.to, "filename", r->filename);
+    apr_table_add(xx.to, "path_info", (gdc->path ? strlen(gdc->path) : 0) + (r->uri) );
     
     apr_table_do(setfrom, &xx, gdc->parm_headers, NULL);
 
@@ -407,7 +412,7 @@ static const char *init_pq_config(cmd_parms *cmd, void *dconf, const char *pn, c
     if (0 == strcasecmp("<Location", parent)) {
         gdc->location = 1;
     }
-    if (0 == strcasecmp("<LocationMath", parent)) {
+    if (0 == strcasecmp("<LocationMatch", parent)) {
         gdc->location = 1; // return "Git in LocationMatch stanza not supported";
     }
     

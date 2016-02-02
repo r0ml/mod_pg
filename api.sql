@@ -1,19 +1,61 @@
 CREATE SCHEMA api;
 GRANT USAGE on SCHEMA api to PUBLIC;
 
-DO LANGUAGE plpgsql $$ BEGIN CREATE USER sessioner; EXCEPTION when duplicate_object THEN
-  RAISE NOTICE 'sessioner already exists';
-  END $$;
-
 CREATE OR REPLACE FUNCTION api.json_text(json) RETURNS text IMMUTABLE LANGUAGE sql AS $$
   SELECT ('['||$1||']')::json->>0 $$;
 
+CREATE or REPLACE FUNCTION api.raw(jparms json) RETURNS json LANGUAGE plpgsql AS $$
+DECLARE
+  result json;
+  cmd varchar;
+BEGIN
+  cmd = coalesce(jparms->>'cmd','');
+  return api.run_raw(cmd, jparms);
+END $$; 
+
+CREATE OR REPLACE FUNCTION api.run_raw(cmd varchar, jparms json) RETURNS json LANGUAGE plpgsql AS $$
+DECLARE
+  result json;
+  flag text;
+  first boolean;
+  cmd2 text;
+  rec json; mor json; inter json[];
+BEGIN
+  DROP TABLE IF EXISTS "S 1";
+  cmd2 = 'CREATE TEMPORARY TABLE "S 1" ON COMMIT DROP AS ' || cmd;
+  raise notice 'select: %', cmd2;
+  execute cmd2;
+  flag = jparms ->> 'asarray';
+  if flag IS NOT NULL and (flag = '1' OR flag='true') THEN
+    first := true;
+    for rec in select row_to_json("S 1") as rec from "S 1"
+    loop
+      if first then 
+        first := false;
+        mor := array_to_json(array(select json_object_keys(rec)));
+        inter := array_append(inter, mor);
+      end if;
+      mor := array_to_json(array(select value from json_each(rec)));
+      inter := array_append(inter, mor);
+    end loop;
+    result := array_to_json( inter) ;
+  ELSE
+    SELECT array_to_json( coalesce(array_agg(row_to_json(a)),'{}')) FROM "S 1" AS a INTO result;
+  END IF;
+  return result;
+END $$;
+
+-- jparms are:
+--     table: the table name
+--     fields: an array of field names
+--     limit:  the number of rows to retrieve
+--     offset: the row number to start at (skip the first offset rows)
+--     where: field / literal
 CREATE OR REPLACE FUNCTION api.select(jparms json) RETURNS json LANGUAGE plpgsql AS $$
 DECLARE
   result json;
   schm varchar; tbl varchar;  flds varchar; lmt varchar; offs varchar; ws json;
   fnn varchar[];
-  rec json; mor json;
   inter json[];
   cmd text; flag text; wher text; lit text; wf text;
   first boolean;
@@ -41,32 +83,10 @@ BEGIN
   if lit like '"%' then lit := quote_literal(ws ->> 1); end if;
   
   wher = coalesce( ' WHERE ' || wf || '=' || lit, '');
-  DROP TABLE IF EXISTS "S 1";
-  cmd = 'CREATE TEMPORARY TABLE "S 1" ON COMMIT DROP AS SELECT  ' || flds || ' FROM ' || schm || tbl || wher || offs || lmt ;
-  raise notice 'select: %', cmd;
-  execute cmd;
-
-  flag = jparms ->> 'asarray';
-  if flag IS NOT NULL and (flag = '1' OR flag='true') THEN
-    first := true;
-    for rec in select row_to_json("S 1") as rec from "S 1"
-    loop
-      if first then 
-        first := false;
-        mor := array_to_json(array(select json_object_keys(rec)));
-        inter := array_append(inter, mor);
-      end if;
-      mor := array_to_json(array(select value from json_each(rec)));
-      inter := array_append(inter, mor);
-    end loop;
-    result := array_to_json( inter) ;
-  ELSE
-    SELECT array_to_json( coalesce(array_agg(row_to_json(a)),'{}')) FROM "S 1" AS a INTO result;
-  END IF;
-  return result;
+  return api.run_raw('SELECT ' || flds || ' FROM ' || schm || tbl || wher || offs || lmt) ;
 END $$;
 
-
+-- executing a stored procedure which returns a result set
 CREATE OR REPLACE FUNCTION api.execute(jparms json) RETURNS json LANGUAGE plpgsql AS $$
 DECLARE
   schm varchar; proc varchar;
@@ -89,7 +109,7 @@ BEGIN
   END IF;
   
   args = jparms->'args';
-  cmd = 'CREATE TEMPORARY TABLE "X 1" ON COMMIT DROP AS SELECT  * FROM ' || schm || proc || '(';
+  cmd = 'SELECT * FROM ' || schm || proc || '(';
   for x in 1..json_array_length(args) loop
     if x > 1 then cmd := cmd || ','; end if;
     var := (args -> (x-1))::text;
@@ -97,21 +117,8 @@ BEGIN
     cmd := cmd || var;
   end loop;
   cmd := cmd || ')';
---  BEGIN DROP TABLE IF EXISTS "X 1"; EXCEPTION WHEN OTHERS THEN END;
-  RAISE NOTICE '%', cmd;
-  execute cmd;
   
-  flag = jparms ->> 'asarray';
-  if flag IS NOT NULL and (flag = '1' OR flag='true') THEN
-    for rec in select row_to_json("X 1") as rec from "X 1" loop
-      mor := array_to_json(array(select value from json_each(rec)));
-      inter := array_append(inter, mor);
-    end loop;
-    result := array_to_json(inter);
-  ELSE
-    SELECT array_to_json( coalesce(array_agg(row_to_json(a)),'{}')) FROM "X 1" AS a INTO result;
-  END IF;
-  return result;
+  return api.run_raw(cmd, jparms);
 END $$;
 
 CREATE OR REPLACE FUNCTION api.json_type(j json) RETURNS text LANGUAGE plpgsql AS $$
@@ -123,6 +130,7 @@ BEGIN
   END;
 END $$;
 
+-- executing a stored procedure which returns a value (not a result set)
 CREATE OR REPLACE FUNCTION api.eval(jparms json) RETURNS json LANGUAGE plpgsql AS $$
 DECLARE
   schm varchar; proc varchar;
@@ -198,6 +206,7 @@ BEGIN
   elsif op = 'execute' then return api.execute(jparms);
   elsif op = 'eval' then return api.eval(jparms);
   elsif op = 'get' then return api.get_path(jparms);
+  elsif op = 'raw' then return api.raw(jparms);
   else raise exception 'invalid api.passthrough op: %', op;
   end if;
 END $$;
@@ -235,49 +244,26 @@ BEGIN
     ELSE
       jreq := req::json; -- convert request to JSON
       PERFORM api.become(session_state);
-      return api.passthrough(jreq->>'op', jreq);
+      result := api.passthrough(jreq->>'op', jreq);
+      PERFORM api.become(NULL);
+      return result; 
     END IF;
   END IF;
 END $$;
 GRANT EXECUTE on FUNCTION api.api(text, text) TO PUBLIC;
 
-
-create table api.db_session_table(pid int primary key default pg_backend_pid(), start timestamp default now(), state json);
-
-create view api.db_session as select state from api.db_session_table where pid = pg_backend_pid();
-grant select,insert,update on api.db_session to public;
-
-create or replace function api.get_db_session()  returns json language plpgsql as $$
-declare result json; begin
-  select state from api.db_session into result;
-  return result;
-end $$;
-grant execute on function api.get_db_session() to public;
-
-create or replace function api.set_db_session(st json) returns void language plpgsql as $$
-begin
-  if (1 = (select count(*) from api.db_session)) then update api.db_session set state = st;
-  else insert into api.db_session values(st);
-  end if;
-end $$;
-grant execute on function api.set_db_session(json) to public;
-
-
-CREATE TABLE api.web_session_table (
+CREATE TABLE IF NOT EXISTS api.web_session_table (
   session_id varchar primary key,
-  db_session_id int unique default pg_backend_pid(),
   user_id varchar,
-  login_id varchar,
-  login_redirect varchar,
   role varchar,
   ip varchar,
   last_update timestamp default now(),
   created timestamp default now()
 );
-grant insert, update on api.web_session_table to sessioner;
+-- grant insert, update on api.web_session_table to sessioner;
 
-create view api.web_session as select user_id, login_id, login_redirect, role, ip, last_update, created
-  from api.web_session_table where db_session_id = pg_backend_pid();
+create or replace view api.web_session as select user_id, role, ip, last_update, created
+  from api.web_session_table where current_setting('api.session_id'); -- db_session_id = pg_backend_pid();
 grant select, insert on api.web_session to public;
 grant update(last_update) on api.web_session to public;
 
